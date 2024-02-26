@@ -15,6 +15,8 @@ from fairscale.nn.model_parallel.layers import (
 )
 from torch import nn
 
+from typing import List
+
 
 @dataclass
 class ModelArgs:
@@ -233,18 +235,35 @@ class Attention(nn.Module):
             init_method=lambda x: x,
         )
 
-        self.cache_k = torch.zeros(
+        # self.cache_k = torch.zeros(
+        #     (
+        #         args.max_batch_size,
+        #         args.max_seq_len,
+        #         self.n_local_kv_heads,
+        #         self.head_dim,
+        #     )
+        # ).cuda()
+        # self.cache_v = torch.zeros(
+        #     (
+        #         args.max_batch_size,
+        #         args.max_seq_len,
+        #         self.n_local_kv_heads,
+        #         self.head_dim,
+        #     )
+        # ).cuda()
+
+        self.cache_k = torch.empty(
             (
-                args.max_batch_size,
-                args.max_seq_len,
+                1,
+                0,
                 self.n_local_kv_heads,
                 self.head_dim,
             )
         ).cuda()
         self.cache_v = torch.zeros(
             (
-                args.max_batch_size,
-                args.max_seq_len,
+                1,
+                0,
                 self.n_local_kv_heads,
                 self.head_dim,
             )
@@ -256,6 +275,7 @@ class Attention(nn.Module):
         start_pos: int,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
+        recompute,
     ):
         """
         Forward pass of the attention module.
@@ -282,11 +302,21 @@ class Attention(nn.Module):
         self.cache_k = self.cache_k.to(xq)
         self.cache_v = self.cache_v.to(xq)
 
-        self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
-        self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
+        if recompute:
+            cache_len = self.cache_k.size()[1]
+            # check 5 steps ahead
+            start_pos = cache_len - 5
+            self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
+            self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
 
-        keys = self.cache_k[:bsz, : start_pos + seqlen]
-        values = self.cache_v[:bsz, : start_pos + seqlen]
+            keys = self.cache_k[:bsz, : start_pos + seqlen]
+            values = self.cache_v[:bsz, : start_pos + seqlen]
+        else:
+            self.cache_k = torch.cat((self.cache_k, xk), dim=1)
+            self.cache_v = torch.cat((self.cache_v, xv), dim=1)
+
+        keys = self.cache_k[:bsz, :]
+        values = self.cache_v[:bsz, :]
 
         # repeat k/v heads if n_kv_heads < n_heads
         keys = repeat_kv(keys, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
@@ -389,6 +419,7 @@ class TransformerBlock(nn.Module):
         start_pos: int,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
+        recompute
     ):
         """
         Perform a forward pass through the TransformerBlock.
@@ -404,7 +435,7 @@ class TransformerBlock(nn.Module):
 
         """
         h = x + self.attention.forward(
-            self.attention_norm(x), start_pos, freqs_cis, mask
+            self.attention_norm(x), start_pos, freqs_cis, mask, recompute
         )
         out = h + self.feed_forward.forward(self.ffn_norm(h))
         return out
@@ -463,7 +494,7 @@ class Transformer(nn.Module):
             start_pos (int): Starting position for attention caching.
 
         Returns:
-            torch.Tensor: Output logits after applying the Transformer model.
+            torch.Tensor: Output logitse after applying the Transformer model.
 
         """
         _bsz, seqlen = tokens.shape
@@ -489,7 +520,262 @@ class Transformer(nn.Module):
             ]).type_as(h)
 
         for layer in self.layers:
-            h = layer(h, start_pos, freqs_cis, mask)
+            h = layer(h, start_pos, freqs_cis, mask, False)
         h = self.norm(h)
         output = self.output(h).float()
         return output
+
+    @torch.inference_mode()
+    def forward_with_skip(self, tokens: torch.Tensor, start_pos: int, skip_params, datastore, tokenizer, debug):
+        """
+        Perform a forward pass through the Transformer model.
+
+        Args:
+            tokens (torch.Tensor): Input token indices.
+            start_pos (int): Starting position for attention caching.
+            skip_params: list[tuple[int, int]]: layers ids to skip
+
+        Returns:
+            torch.Tensor: Output logits after applying the Transformer model.
+
+        """
+        _bsz, seqlen = tokens.shape
+        h = self.tok_embeddings(tokens)
+        self.freqs_cis = self.freqs_cis.to(h.device)
+        freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
+
+        mask = None
+        if seqlen > 1:
+            mask = torch.full(
+                (seqlen, seqlen), float("-inf"), device=tokens.device
+            )
+
+            mask = torch.triu(mask, diagonal=1)
+
+            # When performing key-value caching, we compute the attention scores
+            # only for the new sequence. Thus, the matrix of scores is of size
+            # (seqlen, cache_len + seqlen), and the only masked entries are (i, j) for
+            # j > cache_len + i, since row i corresponds to token cache_len + i.
+            mask = torch.hstack([
+                torch.zeros((seqlen, start_pos), device=tokens.device),
+                mask
+            ]).type_as(h)
+
+        for i, layer in enumerate(self.layers):
+            if should_skip(skip_params, i) is True:
+                # copy kv cache
+                copy_kv_cache(self.layers[i-1], layer, _bsz, start_pos, 1)
+                # notify layer skipped
+                skipped_notification = "layer_skipped"
+                if debug is True:
+                    if start_pos not in datastore:
+                        datastore[start_pos] = []
+                        datastore[start_pos].append(99999999)
+                    else:
+                        datastore[start_pos].append(99999999)
+                continue
+            else:
+                h = layer(h, start_pos, freqs_cis, mask)
+                if debug is True:
+                    h_out = self.norm(h)
+                    logits = self.output(h_out).float()
+                    # tokenizer(output)
+                    next_token = torch.argmax(logits[:, -1], dim=-1)
+                    next_token = next_token.reshape(-1)
+                    if start_pos not in datastore:
+                        datastore[start_pos] = []
+                        datastore[start_pos].append(next_token.tolist()[0])
+                    else:
+                        datastore[start_pos].append(next_token.tolist()[0])
+                    # word = tokenizer.decode(next_token.tolist())
+                    # print(word, end=' ')
+        h = self.norm(h)
+        output = self.output(h).float()
+        return output
+
+    @torch.inference_mode()
+    def forward_with_skip_drop(self, tokens: torch.Tensor, start_pos: int, skip_params, datastore,
+                               tokenizer, drop_param, layer_to_save_state, debug):
+        """
+        Perform a forward pass through the Transformer model.
+
+        Args:
+            tokens (torch.Tensor): Input token indices.
+            start_pos (int): Starting position for attention caching.
+            skip_params: list[tuple[int, int]]: layers ids to skip
+
+        Returns:
+            torch.Tensor: Output logits after applying the Transformer model.
+
+        """
+
+        _bsz, seqlen = tokens.shape
+        h = self.tok_embeddings(tokens)
+        self.freqs_cis = self.freqs_cis.to(h.device)
+        freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
+
+        mask = None
+        if seqlen > 1:
+            mask = torch.full(
+                (seqlen, seqlen), float("-inf"), device=tokens.device
+            )
+
+            mask = torch.triu(mask, diagonal=1)
+
+            # When performing key-value caching, we compute the attention scores
+            # only for the new sequence. Thus, the matrix of scores is of size
+            # (seqlen, cache_len + seqlen), and the only masked entries are (i, j) for
+            # j > cache_len + i, since row i corresponds to token cache_len + i.
+            mask = torch.hstack([
+                torch.zeros((seqlen, start_pos), device=tokens.device),
+                mask
+            ]).type_as(h)
+
+        
+        layer_state = None
+
+        for i, layer in enumerate(self.layers):
+
+            if drop_param is not None:
+                start_drop_pos = drop_param[0]
+                drop_len = drop_param[1]
+                # drop_all_layer_kv_cache(self.layers, _bsz, start_drop_pos, drop_len)'
+
+            if should_skip(skip_params, i) is True:
+                # copy kv cache
+
+                copy_kv_cache(self.layers[i-1], layer, _bsz, start_pos, 1)
+                # notify layer skipped
+                skipped_notification = "layer_skipped"
+                if debug is True:
+                    if start_pos not in datastore:
+                        datastore[start_pos] = []
+                        datastore[start_pos].append(99999999)
+                    else:
+                        datastore[start_pos].append(99999999)
+                continue
+            else:
+                h = layer(h, start_pos, freqs_cis, mask, False)
+                if i == layer_to_save_state:
+                    layer_state = h
+                if debug is True:
+                    h_out = self.norm(h)
+                    logits = self.output(h_out).float()
+                    # tokenizer(output)
+                    next_token = torch.argmax(logits[:, -1], dim=-1)
+                    next_token = next_token.reshape(-1)
+                    if start_pos not in datastore:
+                        datastore[start_pos] = []
+                        datastore[start_pos].append(next_token.tolist()[0])
+                    else:
+                        datastore[start_pos].append(next_token.tolist()[0])
+                    # word = tokenizer.decode(next_token.tolist())
+                    # print(word, end=' ')
+        h = self.norm(h)
+        output = self.output(h).float()
+
+        return output, layer_state
+    
+    @torch.inference_mode()
+    def recompute(self, h: torch.Tensor, start_pos: int, restart_layer, datastore, debug):
+        # _bsz, seqlen = tokens.shape
+        # h = self.tok_embeddings(tokens)
+        _bsz = 1
+        seqlen = 1
+
+        self.freqs_cis = self.freqs_cis.to(h.device)
+        freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
+
+        mask = None
+        # if seqlen > 1:
+        #     mask = torch.full(
+        #         (seqlen, seqlen), float("-inf"), device=tokens.device
+        #     )
+
+        #     mask = torch.triu(mask, diagonal=1)
+
+        #     # When performing key-value caching, we compute the attention scores
+        #     # only for the new sequence. Thus, the matrix of scores is of size
+        #     # (seqlen, cache_len + seqlen), and the only masked entries are (i, j) for
+        #     # j > cache_len + i, since row i corresponds to token cache_len + i.
+        #     mask = torch.hstack([
+        #         torch.zeros((seqlen, start_pos), device=tokens.device),
+        #         mask
+        #     ]).type_as(h)
+
+        for i, layer in enumerate(self.layers):
+            if i < restart_layer:
+                continue
+            else:
+                recompute = True
+                h = layer(h, start_pos, freqs_cis, mask, recompute)
+                if debug is True:
+                    h_out = self.norm(h)
+                    logits = self.output(h_out).float()
+                    # tokenizer(output)
+                    next_token = torch.argmax(logits[:, -1], dim=-1)
+                    next_token = next_token.reshape(-1)
+                    datastore[start_pos][i] = next_token.tolist()[0]
+                    # word = tokenizer.decode(next_token.tolist())
+                    # print(word, end=' ')
+        h = self.norm(h)
+        output = self.output(h).float()
+        return output
+        
+
+    def fix_windows_size(self, num_sink, window):
+        for l in self.layers:
+            l.attention.cache_k = torch.cat((l.attention.cache_k[:, :num_sink], l.attention.cache_k[:, num_sink+1:num_sink+1+window]), dim=1)
+            l.attention.cache_v = torch.cat((l.attention.cache_v[:, :num_sink], l.attention.cache_v[:, num_sink+1:num_sink+1+window]), dim=1)
+            torch.cuda.empty_cache()
+
+    def clear_kv_cache(self):
+        for l in self.layers:
+            l.attention.cache_k = torch.empty(
+            (
+                1,
+                0,
+                l.attention.n_local_kv_heads,
+                l.attention.head_dim,
+            )
+            ).cuda()
+            l.attention.cache_v = torch.zeros(
+                (
+                    1,
+                    0,
+                    l.attention.n_local_kv_heads,
+                    l.attention.head_dim,
+                )
+            ).cuda()
+            torch.cuda.empty_cache()
+
+
+def drop_all_layer_kv_cache(layers, bsz, pos, length):
+    for l in layers:
+        drop_kv_cache(l, bsz, pos, length)
+
+
+
+def drop_kv_cache(layer, bsz, pos, length):
+    layer.attention.cache_k[:bsz, pos:pos+length, :] = float("-inf")
+    layer.attention.cache_v[:bsz, pos:pos+length, :] = float("-inf")
+    # layer.attention.cache_k = torch.cat((layer.attention.cache_k[:bsz, :pos], layer.attention.cache_k[:bsz, pos+length:]), dim=1)
+    # layer.attention.cache_v = torch.cat((layer.attention.cache_v[:bsz, :pos], layer.attention.cache_v[:bsz, pos+length:]), dim=1)
+
+def copy_kv_cache(from_layer, to_layer, bsz, start_pos, num_elem):
+    # get kv cache
+    # to_layer.attention.cache_k[:bsz, start_pos:start_pos+num_elem] = torch.clone(from_layer.attention.cache_k[:bsz, start_pos:start_pos+num_elem])
+    # to_layer.attention.cache_v[:bsz, start_pos:start_pos+num_elem] = torch.clone(from_layer.attention.cache_v[:bsz, start_pos:start_pos+num_elem])
+    to_layer.attention.cache_k= torch.cat((to_layer.attention.cache_k[:bsz, :], torch.clone(from_layer.attention.cache_k[:bsz, -1:])), dim=1)
+    to_layer.attention.cache_v= torch.cat((to_layer.attention.cache_v[:bsz, :], torch.clone(from_layer.attention.cache_v[:bsz, -1:])), dim=1)
+    torch.cuda.empty_cache()
+
+def should_skip(skip_params, layer_id):
+    for p in skip_params:
+        (start, end) = p
+        if start <= 0:
+            raise ValueError("Can't skip the first layer yet")
+        if start <= layer_id <= end:
+            return True
+    return False
+
