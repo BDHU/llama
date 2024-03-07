@@ -85,97 +85,16 @@ def get_loaders(name, nsamples=128, seed=0, seqlen=2048, tokenizer=None):
 python -m torch.distributed.launch --nproc_per_node=1 --master_port=25691 perplexity_eval.py 
 """
 
-def calc_skip_layer(min_skip_layer, max_skip_layer, max_seq_len, num_decoder_layers, token_id, drop_type):
-    if drop_type == "linear":
-        interval = max_seq_len / (max_skip_layer - min_skip_layer + 1)
-        to_reduce = int(token_id / interval)
-        layer_to_exit = max_skip_layer - to_reduce
-        
-        if layer_to_exit > max_skip_layer:
-            layer_to_exit = max_skip_layer
-        if layer_to_exit < min_skip_layer:
-            layer_to_exit = min_skip_layer
-        return layer_to_exit, max_skip_layer
-    elif drop_type == "linear_flat":
-        interval = (max_seq_len/2) / (max_skip_layer - min_skip_layer + 1)
-        if token_id < max_seq_len:
-            to_reduce = int(token_id / interval)
-            layer_to_exit = max_skip_layer - to_reduce
-        else:
-            to_add = int(token_id / interval)
-            layer_to_exit = min_skip_layer + to_add
-        
-        if layer_to_exit > max_skip_layer:
-            layer_to_exit = max_skip_layer
-        if layer_to_exit < min_skip_layer:
-            layer_to_exit = min_skip_layer
-        return layer_to_exit, max_skip_layer
-    elif drop_type == "linear_U":
-        interval = (max_seq_len/2) / (max_skip_layer - min_skip_layer + 1)
-        if token_id < max_seq_len/2:
-            to_reduce = int(token_id / interval)
-            layer_to_exit = max_skip_layer - to_reduce
-        else:
-            to_add = int((token_id - max_seq_len/2) / interval)
-            layer_to_exit = min_skip_layer + to_add
-        
-        if layer_to_exit > max_skip_layer:
-            layer_to_exit = max_skip_layer
-        if layer_to_exit < min_skip_layer:
-            layer_to_exit = min_skip_layer
-        return layer_to_exit, max_skip_layer
-    elif drop_type == "linear_full":
-        interval = max_seq_len / (max_skip_layer - min_skip_layer + 1)
-        to_reduce = int(token_id / interval)
-        layer_to_exit = max_skip_layer - to_reduce
-        
-        if layer_to_exit > max_skip_layer:
-            layer_to_exit = max_skip_layer
-        if layer_to_exit < min_skip_layer:
-            layer_to_exit = min_skip_layer
-        
-        if token_id > max_seq_len - 250:
-            return 9999, 9999
-        return layer_to_exit, max_skip_layer
-    elif drop_type == "periodic_512_100":
-        if token_id < 50:
-            return 9999, 9999
-        token_id -= 128
-        token_id = token_id % (512 + 100)
-
-        interval = 512 / (max_skip_layer - min_skip_layer + 1)
-        to_reduce = int(token_id / interval)
-        layer_to_exit = max_skip_layer - to_reduce
-        if token_id > 512:
-            return 9999, 9999
-        
-        if layer_to_exit > max_skip_layer:
-            layer_to_exit = max_skip_layer
-        if layer_to_exit < min_skip_layer:
-            layer_to_exit = min_skip_layer
-        return layer_to_exit, max_skip_layer
-   
-
-def calc_kv_drop(token_id):
-    if (token_id-128) % (512+100) == 0 and (token_id-128) / 612 < 1.1:
-        pos = token_id - (512+100)
-        length = 512
-        return (pos, length)
-    elif (token_id-128) % (512+100) == 0 and (token_id-128) / 612 > 1.1:
-        pos = token_id - (512+100+100)
-        length = 512+100
-        return (pos, length)
-    return None
-
-def get_window_size(model):
+def get_attention_size(model):
     cur_window_size = model.layers[0].attention.cache_k.size()[1]
     assert(cur_window_size == model.layers[0].attention.cache_v.size()[1])
     return cur_window_size
 
-def shrink_window(model, window_size, sink):
-    if get_window_size(model) >= window_size:
-        model.fix_windows_size(sink, window_size)
+def kv_cache_resize(model, start_size, recent_size):
+    if get_attention_size(model) >= start_size + recent_size:
+        model.kv_cache_resize(start_size, recent_size)
 
+def get_skip_param()
     
 
 def evaluate_perplexity(model, tokenizer, model_args):
@@ -191,17 +110,33 @@ def evaluate_perplexity(model, tokenizer, model_args):
     nlls = []
     print(f"nsamples {nsamples}")
     # nsamples = 10 #Sanity check
-    nsamples = 1
-    
-    
-    data_store = [] 
+
+    # hyperparameters init
+    step_size = 40  # Control the rate of monotonic dropping, e.g. after step_size tokens is generated, skip one additional layer for the follwoing step_size tokens.
+    max_skip_layer = 22 # The highest layer than can be skipped, all layers after max_skip_layer are not skipped
+    min_skip_layer = 8 # The lowest layer that can be skipped, all layer before min_skip_layer can not be skipped
+    error_threshold = 1 # The number of divergent tokens allowed after recomputing skipped layers
+    check_period = 10 # How often recomputation should happen, after every check_period tokens are generated, perform recomputation
+    start_size = 128   # streaming-LLM parameter
+    recent_size = 512  # streaming-LLM param
+    debug = False
+    no_skip = False # no layer skipping
+    data_store = [] # used for debugging
+ 
     import time
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     # start.record()
     # Loop through each batch
     for i in range(0, nsamples, bs):
-        data_store_per_batch = {}
+         # parameters need for each batch
+        dropped_layers = [] # record which layers (start, end_layer) are dropped for each token
+        exit_layer_states = []  # for recomputation, keep the layer states of the before start_layer
+        prev_words = [] # record words/tokens generated with layer skipping
+        incr_counter = 0    # specify which layer to stop skipping: (max_skip_layer + 1) - incr_counter
+        error_count = 0 # keep track of # of divergences occuring after recomputation
+        data_store_per_batch = {}   # used for debugging
+        
         # print(f"sample {i}/{nsamples} || skipped layers {model.skiped_layers}/{model.total_layers}")
         # model.sk = 0
         # Calculate end index
@@ -211,20 +146,12 @@ def evaluate_perplexity(model, tokenizer, model_args):
         inputs = inputs.reshape(j-i, seqlen)
         batch_logits = torch.zeros((bs, seqlen, 32000), dtype=torch.float32).cuda()
         prev_pos = 0
-        prompt_size = 128
+        prompt_size = start_size
         prompt = inputs[:, :prompt_size]
         # clear up the kv cache
         model.clear_kv_cache()
         logits = model.forward(prompt, prev_pos)
         batch_logits[:, prev_pos:prompt_size, :] = logits
-        
-        dropped_layers = []
-        exit_layer_states = []
-        prev_words = []
-        incr_counter = 0
-        step_size = 40
-        error_count = 0
-        check_period = 15
 
         start.record()
 
@@ -232,67 +159,68 @@ def evaluate_perplexity(model, tokenizer, model_args):
 
             # copy_states(model, dropped_layers, bsz=1)
 
-            if get_window_size(model) >= 512+prompt_size:
-                shrink_window(model, 512+prompt_size, prompt_size)
+            # 1. resize the kv cache to keep a fixed size
+            kv_cache_resize(model, recent_size, prompt_size)
 
-
+            # 2. calculate which layers should be skipped
+            start_skip, end_skip = get_skip_param(curr_pos,
+                                                  prompt_size,
+                                                  step_size,
+                                                  min_skip_layer,
+                                                  max_skip_layer,
+                                                  incr_counter)
 
             if (curr_pos-prompt_size) % step_size == 0:
-                start_skip = 22 - incr_counter
-                end_skip = 22
+                start_skip = (max_skip_layer + 1) - incr_counter
+                end_skip = max_skip_layer
                 incr_counter += 1
-                if 8 >= start_skip:
-                    start_skip = 8
+                if min_skip_layer >= start_skip:
+                    start_skip = min_skip_layer
 
             # start_skip = 9999
             # end_skip = 9999
 
-
-            # start_skip, end_skip = calc_skip_layer(8, 22, seqlen, 32, curr_pos-prompt_size+1, "linear_U")
+            # 3. perform layer skipping
+            logits, exit_layer_state = model.forward_with_skipping(inputs[:, curr_pos: curr_pos + 1],
+                                                                   curr_pos,
+                                                                   (start_skip, end_skip),
+                                                                    data_store_per_batch,
+                                                                    True)
+            
+            # 4. keep track of skipped layers and intermediate states for recomputation
             dropped_layers.append((start_skip, end_skip))
-            drop_param = calc_kv_drop(curr_pos)
-            logits, exit_layer_state = model.forward_with_skip_drop(inputs[:, curr_pos: curr_pos + 1], curr_pos, [(start_skip, end_skip)],
-                                                                    data_store_per_batch, tokenizer, drop_param, start_skip-1, True)
-            # logits, exit_layer_state = model.forward_with_skip_drop(inputs[:, curr_pos: curr_pos + 1], curr_pos, [(9999, 9999)],
-            #                                                         data_store_per_batch, tokenizer, drop_param, start_skip-1, True)
             exit_layer_states.append(exit_layer_state)
-            batch_logits[:, curr_pos, :] = logits
-
             next_token = torch.argmax(logits[:, -1], dim=-1)
             next_token = next_token.reshape(-1)
             word = tokenizer.decode(next_token.tolist())
             prev_words.append(word)
-            # print(word, end='')
+            
+            batch_logits[:, curr_pos, :] = logits
 
-
+            # 5. perform recomputation
             sample_pos = curr_pos - 5
             if curr_pos % check_period == 0:
                 # recompute, choose the first one for now
-                # sample_pos = curr_pos - 5
+                sample_pos = curr_pos - 5
                 state = exit_layer_states[sample_pos-prompt_size]
                 restart_layer = dropped_layers[sample_pos-prompt_size][0]
                 prev_word = prev_words[sample_pos-prompt_size]
-                recomputed_out = model.recompute(state, sample_pos, restart_layer, data_store_per_batch, True)
+                recomputed_out = model.recompute(state, sample_pos, restart_layer, data_store_per_batch, False)
                 next_token = torch.argmax(recomputed_out[:, -1], dim=-1)
                 next_token = next_token.reshape(-1)
                 word = tokenizer.decode(next_token.tolist())
                 if word != prev_word:
                     error_count += 1
-                    check_period = int(check_period / 2)
-                    if check_period <= 0:
-                        check_period = 1
+                    # check_period = int(check_period / 2)
+                    # if check_period <= 0:
+                    #     check_period = 1
 
-                if error_count >= 20:
+                if error_count >= error_threshold:
                     incr_counter = 0
                     error_count = 0
-                    check_period = 15
+                    check_period = step_size / 2
                     
-
-
-
         data_store.append(data_store_per_batch)
-
-
         shift_logits = batch_logits[:, :-1, :].contiguous()
         shift_labels = inputs[:, 1:]
         # Compute loss
@@ -304,10 +232,6 @@ def evaluate_perplexity(model, tokenizer, model_args):
         neg_log_likelihood = loss.float() * seqlen * (j-i)
         # Append to list of negative log likelihoods
         nlls.append(neg_log_likelihood)
-        # if i % 5 == 0:
-        #     end.record()
-        #     torch.cuda.synchronize()
-        #     print(f"Total Elapsed Time Till Now: {start.elapsed_time(end)/1000:.2f} sec.")
     
     end.record()
     torch.cuda.synchronize()
