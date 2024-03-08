@@ -115,10 +115,18 @@ def get_skip_param(gen_counter,
         start_skip = min_skip_layer
     return start_skip, end_skip, incr_counter
 
+def skipped(start_skip, end_skip):
+    if start_skip <= -1 and end_skip <= -1:
+        return False
+    if start_skip > end_skip:
+        return False
+    return True
+
 def recompute(curr_pos,
               gen_counter,
               model,
               tokenizer,
+              look_back,
               start_size,
               recent_size,
               exit_layer_states,
@@ -131,21 +139,22 @@ def recompute(curr_pos,
               data_store_per_batch,
               debug
               ):
-    look_back = 1
+    print(len(exit_layer_states))
     sample_pos = curr_pos - start_size - look_back
+    if sample_pos < 0:
+        sample_pos = 0
     prev_state = exit_layer_states[sample_pos]
-    prev_layer, *_ = dropped_layers[sample_pos]
+    prev_start_layer, prev_end_layer = dropped_layers[sample_pos]
     prev_word = prev_words[sample_pos]
     new_word = prev_word
+    if not skipped(prev_start_layer, prev_end_layer):
+        return new_word, incr_counter, error_count, gen_counter
+
     if curr_pos % check_period == 0:
-        look_back = 1
-        sample_pos = curr_pos - start_size - look_back
-        prev_state = exit_layer_states[sample_pos]
-        prev_layer, *_ = dropped_layers[sample_pos]
-        prev_word = prev_words[sample_pos]
         new_out = model.recompute(prev_state,
                                 curr_pos - look_back,
-                                prev_layer,
+                                look_back,
+                                prev_start_layer,
                                 data_store_per_batch,
                                 debug)
         new_token = torch.argmax(new_out[:, -1], dim=-1)
@@ -160,10 +169,6 @@ def recompute(curr_pos,
             gen_counter = 0
     
     return new_word, incr_counter, error_count, gen_counter
-
-
-
-    
 
 def evaluate_perplexity(model, tokenizer, model_args):
     dataset = "wikitext2"
@@ -186,8 +191,9 @@ def evaluate_perplexity(model, tokenizer, model_args):
     min_skip_layer = 8 # The lowest layer that can be skipped, all layer before min_skip_layer can not be skipped
     error_threshold = 5 # The number of divergent tokens allowed after recomputing skipped layers
     check_period = 10 # How often recomputation should happen, after every check_period tokens are generated, perform recomputation
-    start_size = 128   # streaming-LLM parameter
+    start_size = 64   # streaming-LLM parameter
     recent_size = 512  # streaming-LLM param
+    look_back = 2 # bacted recompute
     debug = False
     no_skip = False # no layer skipping
     data_store = [] # used for debugging
@@ -262,6 +268,7 @@ def evaluate_perplexity(model, tokenizer, model_args):
                       gen_counter,
                       model,
                       tokenizer,
+                      look_back,
                       start_size,
                       recent_size,
                       exit_layer_states,

@@ -275,7 +275,6 @@ class Attention(nn.Module):
         start_pos: int,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
-        recompute,
     ):
         """
         Forward pass of the attention module.
@@ -302,18 +301,8 @@ class Attention(nn.Module):
         self.cache_k = self.cache_k.to(xq)
         self.cache_v = self.cache_v.to(xq)
 
-        if recompute:
-            cache_len = self.cache_k.size()[1]
-            # check 1 steps ahead
-            start_pos = cache_len - 1
-            self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
-            self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
-
-            keys = self.cache_k[:bsz, : start_pos + seqlen]
-            values = self.cache_v[:bsz, : start_pos + seqlen]
-        else:
-            self.cache_k = torch.cat((self.cache_k, xk), dim=1)
-            self.cache_v = torch.cat((self.cache_v, xv), dim=1)
+        self.cache_k = torch.cat((self.cache_k, xk), dim=1)
+        self.cache_v = torch.cat((self.cache_v, xv), dim=1)
 
         keys = self.cache_k[:bsz, :]
         values = self.cache_v[:bsz, :]
@@ -327,6 +316,71 @@ class Attention(nn.Module):
         values = values.transpose(1, 2) # (bs, n_local_heads, cache_len + seqlen, head_dim)
         scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
         if mask is not None:
+            scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
+        scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+        output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
+        output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
+        return self.wo(output)
+
+    def recompute(
+        self,
+        x: torch.Tensor,
+        start_pos: int,
+        look_back: int,
+        freqs_cis: torch.Tensor,
+        mask: Optional[torch.Tensor],
+    ):
+        """
+        Forward pass of the attention module.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+            start_pos (int): Starting position for caching.
+            freqs_cis (torch.Tensor): Precomputed frequency tensor.
+            mask (torch.Tensor, optional): Attention mask tensor.
+
+        Returns:
+            torch.Tensor: Output tensor after attention.
+
+        """
+        bsz, seqlen, _ = x.shape
+        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+
+        xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
+        xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+        xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+
+        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+
+        self.cache_k = self.cache_k.to(xq)
+        self.cache_v = self.cache_v.to(xq)
+
+        ##################### recompute #####################
+        cache_len = self.cache_k.size()[1]
+        # check 1 steps ahead
+        start_pos = cache_len - 1 - look_back
+        self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
+        self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
+
+        keys = self.cache_k[:bsz, : start_pos + seqlen]
+        values = self.cache_v[:bsz, : start_pos + seqlen]
+        ##################### recompute #####################
+
+        keys = self.cache_k[:bsz, :]
+        values = self.cache_v[:bsz, :]
+
+        # repeat k/v heads if n_kv_heads < n_heads
+        keys = repeat_kv(keys, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
+        values = repeat_kv(values, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
+
+        xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
+        keys = keys.transpose(1, 2) # (bs, n_local_heads, cache_len + seqlen, head_dim)
+        values = values.transpose(1, 2) # (bs, n_local_heads, cache_len + seqlen, head_dim)
+        scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
+        if mask is not None:
+            print("here")
+            print(scores.shape)
+            print(mask.shape)
             scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
         output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
@@ -380,12 +434,8 @@ class FeedForward(nn.Module):
 
 class TransformerBlock(nn.Module):
     def __init__(self, layer_id: int, args: ModelArgs):
-        """
-        Initialize a TransformerBlock.
-
-        Args:
-            layer_id (int): Identifier for the layer.
-            args (ModelArgs): Model configuration parameters.
+        """  File "/home/edwardhu/workspace/llama/llama/model.py", line 687, in recompute
+figuration parameters.
 
         Attributes:
             n_heads (int): Number of attention heads.
@@ -419,7 +469,6 @@ class TransformerBlock(nn.Module):
         start_pos: int,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
-        recompute
     ):
         """
         Perform a forward pass through the TransformerBlock.
@@ -435,7 +484,34 @@ class TransformerBlock(nn.Module):
 
         """
         h = x + self.attention.forward(
-            self.attention_norm(x), start_pos, freqs_cis, mask, recompute
+            self.attention_norm(x), start_pos, freqs_cis, mask
+        )
+        out = h + self.feed_forward.forward(self.ffn_norm(h))
+        return out
+    
+    def recompute(
+        self,
+        x: torch.Tensor,
+        start_pos: int,
+        look_back: int,
+        freqs_cis: torch.Tensor,
+        mask: Optional[torch.Tensor],
+    ):
+        """
+        Perform a forward pass through the TransformerBlock.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+            start_pos (int): Starting position for attention caching.
+            freqs_cis (torch.Tensor): Precomputed cosine and sine frequencies.
+            mask (torch.Tensor, optional): Masking tensor for attention. Defaults to None.
+
+        Returns:
+            torch.Tensor: Output tensor after applying attention and feedforward layers.
+
+        """
+        h = x + self.attention.recompute(
+            self.attention_norm(x), start_pos, look_back, freqs_cis, mask
         )
         out = h + self.feed_forward.forward(self.ffn_norm(h))
         return out
@@ -520,7 +596,7 @@ class Transformer(nn.Module):
             ]).type_as(h)
 
         for layer in self.layers:
-            h = layer(h, start_pos, freqs_cis, mask, False)
+            h = layer(h, start_pos, freqs_cis, mask)
         h = self.norm(h)
         output = self.output(h).float()
         return output
@@ -585,7 +661,7 @@ class Transformer(nn.Module):
                         datastore[start_pos].append(skipped_notation)
                 continue
             else:
-                h = layer(h, start_pos, freqs_cis, mask, False)
+                h = layer(h, start_pos, freqs_cis, mask)
                 if i == layer_to_save_state:
                     start_skip_layer_state = h
                 if debug is True:
@@ -604,44 +680,43 @@ class Transformer(nn.Module):
         return output, start_skip_layer_state
     
     @torch.inference_mode()
-    def recompute(self, h: torch.Tensor, start_pos: int, restart_layer, datastore, debug):
+    def recompute(self, h: torch.Tensor, start_pos: int, look_back: int, restart_layer, datastore, debug):
         # _bsz, seqlen = tokens.shape
         # h = self.tok_embeddings(tokens)
-        _bsz = 1
-        seqlen = 1
+        _bsz, seqlen, *_ = h.shape
 
         self.freqs_cis = self.freqs_cis.to(h.device)
         freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
 
         mask = None
-        # if seqlen > 1:
-        #     mask = torch.full(
-        #         (seqlen, seqlen), float("-inf"), device=tokens.device
-        #     )
+        if seqlen > 1:
+            mask = torch.full(
+                (seqlen, seqlen), float("-inf"), device=h.device
+            )
 
-        #     mask = torch.triu(mask, diagonal=1)
+            mask = torch.triu(mask, diagonal=1)
 
-        #     # When performing key-value caching, we compute the attention scores
-        #     # only for the new sequence. Thus, the matrix of scores is of size
-        #     # (seqlen, cache_len + seqlen), and the only masked entries are (i, j) for
-        #     # j > cache_len + i, since row i corresponds to token cache_len + i.
-        #     mask = torch.hstack([
-        #         torch.zeros((seqlen, start_pos), device=tokens.device),
-        #         mask
-        #     ]).type_as(h)
+            # When performing key-value caching, we compute the attention scores
+            # only for the new sequence. Thus, the matrix of scores is of size
+            # (seqlen, cache_len + seqlen), and the only masked entries are (i, j) for
+            # j > cache_len + i, since row i corresponds to token cache_len + i.
+            mask = torch.hstack([
+                torch.zeros((seqlen, start_pos), device=h.device),
+                mask
+            ]).type_as(h)
 
         for i, layer in enumerate(self.layers):
             if i < restart_layer:
                 continue
             else:
-                h = layer(h, start_pos, freqs_cis, mask, True)
+                h = layer.recompute(h, start_pos, look_back, freqs_cis, mask)
                 if debug is True:
                     h_out = self.norm(h)
                     logits = self.output(h_out).float()
                     # tokenizer(output)
-                    next_token = torch.argmax(logits[:, -1], dim=-1)
-                    next_token = next_token.reshape(-1)
-                    datastore[start_pos][i] = next_token.tolist()[0]
+                    next_tokens = torch.argmax(logits[:, -1], dim=-1)
+                    next_tokens = next_tokens.reshape(-1)
+                    datastore[start_pos][i] = next_tokens.tolist()[0]
                     # word = tokenizer.decode(next_token.tolist())
                     # print(word, end=' ')
         h = self.norm(h)
