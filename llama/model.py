@@ -304,8 +304,8 @@ class Attention(nn.Module):
 
         if recompute:
             cache_len = self.cache_k.size()[1]
-            # check 5 steps ahead
-            start_pos = cache_len - 5
+            # check 1 steps ahead
+            start_pos = cache_len - 1
             self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
             self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
 
@@ -634,8 +634,7 @@ class Transformer(nn.Module):
             if i < restart_layer:
                 continue
             else:
-                recompute = True
-                h = layer(h, start_pos, freqs_cis, mask, recompute)
+                h = layer(h, start_pos, freqs_cis, mask, True)
                 if debug is True:
                     h_out = self.norm(h)
                     logits = self.output(h_out).float()

@@ -94,7 +94,75 @@ def kv_cache_resize(model, start_size, recent_size):
     if get_attention_size(model) >= start_size + recent_size:
         model.kv_cache_resize(start_size, recent_size)
 
-def get_skip_param()
+def get_skip_param(gen_counter,
+                    step_size,
+                    min_skip_layer,
+                    max_skip_layer,
+                    incr_counter,
+                    no_skip):
+    start_skip = (max_skip_layer + 1) - incr_counter
+    end_skip = max_skip_layer
+    if incr_counter < 0:
+        raise ValueError("incr_counter can not be < 0")
+
+    if no_skip is True:
+        start_skip, end_skip = (-1, -1)
+        return -1, -1, incr_counter
+
+    if gen_counter % step_size == 0:
+        incr_counter += 1
+    if start_skip <= min_skip_layer:
+        start_skip = min_skip_layer
+    return start_skip, end_skip, incr_counter
+
+def recompute(curr_pos,
+              gen_counter,
+              model,
+              tokenizer,
+              start_size,
+              recent_size,
+              exit_layer_states,
+              dropped_layers,
+              prev_words,
+              error_count,
+              error_threshold,
+              check_period,
+              incr_counter,
+              data_store_per_batch,
+              debug
+              ):
+    look_back = 1
+    sample_pos = curr_pos - start_size - look_back
+    prev_state = exit_layer_states[sample_pos]
+    prev_layer, *_ = dropped_layers[sample_pos]
+    prev_word = prev_words[sample_pos]
+    new_word = prev_word
+    if curr_pos % check_period == 0:
+        look_back = 1
+        sample_pos = curr_pos - start_size - look_back
+        prev_state = exit_layer_states[sample_pos]
+        prev_layer, *_ = dropped_layers[sample_pos]
+        prev_word = prev_words[sample_pos]
+        new_out = model.recompute(prev_state,
+                                curr_pos - look_back,
+                                prev_layer,
+                                data_store_per_batch,
+                                debug)
+        new_token = torch.argmax(new_out[:, -1], dim=-1)
+        new_token = new_token.reshape(-1)
+        new_word = tokenizer.decode(new_token.tolist())
+        if new_word != prev_word:
+            error_count += 1
+            # TODO change check period?
+        if error_count >= error_threshold:
+            error_count = 0
+            incr_counter = 0
+            gen_counter = 0
+    
+    return new_word, incr_counter, error_count, gen_counter
+
+
+
     
 
 def evaluate_perplexity(model, tokenizer, model_args):
@@ -110,12 +178,13 @@ def evaluate_perplexity(model, tokenizer, model_args):
     nlls = []
     print(f"nsamples {nsamples}")
     # nsamples = 10 #Sanity check
+    nsamples = 1
 
     # hyperparameters init
     step_size = 40  # Control the rate of monotonic dropping, e.g. after step_size tokens is generated, skip one additional layer for the follwoing step_size tokens.
     max_skip_layer = 22 # The highest layer than can be skipped, all layers after max_skip_layer are not skipped
     min_skip_layer = 8 # The lowest layer that can be skipped, all layer before min_skip_layer can not be skipped
-    error_threshold = 1 # The number of divergent tokens allowed after recomputing skipped layers
+    error_threshold = 5 # The number of divergent tokens allowed after recomputing skipped layers
     check_period = 10 # How often recomputation should happen, after every check_period tokens are generated, perform recomputation
     start_size = 128   # streaming-LLM parameter
     recent_size = 512  # streaming-LLM param
@@ -123,7 +192,6 @@ def evaluate_perplexity(model, tokenizer, model_args):
     no_skip = False # no layer skipping
     data_store = [] # used for debugging
  
-    import time
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     # start.record()
@@ -136,6 +204,7 @@ def evaluate_perplexity(model, tokenizer, model_args):
         incr_counter = 0    # specify which layer to stop skipping: (max_skip_layer + 1) - incr_counter
         error_count = 0 # keep track of # of divergences occuring after recomputation
         data_store_per_batch = {}   # used for debugging
+        gen_counter = 0 # keep track of number of token with layer skipping
         
         # print(f"sample {i}/{nsamples} || skipped layers {model.skiped_layers}/{model.total_layers}")
         # model.sk = 0
@@ -159,26 +228,17 @@ def evaluate_perplexity(model, tokenizer, model_args):
 
             # copy_states(model, dropped_layers, bsz=1)
 
+            gen_counter += 1 
             # 1. resize the kv cache to keep a fixed size
             kv_cache_resize(model, recent_size, prompt_size)
 
             # 2. calculate which layers should be skipped
-            start_skip, end_skip = get_skip_param(curr_pos,
-                                                  prompt_size,
+            start_skip, end_skip, incr_counter = get_skip_param(gen_counter,
                                                   step_size,
                                                   min_skip_layer,
                                                   max_skip_layer,
-                                                  incr_counter)
-
-            if (curr_pos-prompt_size) % step_size == 0:
-                start_skip = (max_skip_layer + 1) - incr_counter
-                end_skip = max_skip_layer
-                incr_counter += 1
-                if min_skip_layer >= start_skip:
-                    start_skip = min_skip_layer
-
-            # start_skip = 9999
-            # end_skip = 9999
+                                                  incr_counter,
+                                                  no_skip)
 
             # 3. perform layer skipping
             logits, exit_layer_state = model.forward_with_skipping(inputs[:, curr_pos: curr_pos + 1],
@@ -198,29 +258,24 @@ def evaluate_perplexity(model, tokenizer, model_args):
             batch_logits[:, curr_pos, :] = logits
 
             # 5. perform recomputation
-            sample_pos = curr_pos - 5
-            if curr_pos % check_period == 0:
-                # recompute, choose the first one for now
-                sample_pos = curr_pos - 5
-                state = exit_layer_states[sample_pos-prompt_size]
-                restart_layer = dropped_layers[sample_pos-prompt_size][0]
-                prev_word = prev_words[sample_pos-prompt_size]
-                recomputed_out = model.recompute(state, sample_pos, restart_layer, data_store_per_batch, False)
-                next_token = torch.argmax(recomputed_out[:, -1], dim=-1)
-                next_token = next_token.reshape(-1)
-                word = tokenizer.decode(next_token.tolist())
-                if word != prev_word:
-                    error_count += 1
-                    # check_period = int(check_period / 2)
-                    # if check_period <= 0:
-                    #     check_period = 1
-
-                if error_count >= error_threshold:
-                    incr_counter = 0
-                    error_count = 0
-                    check_period = step_size / 2
-                    
-        data_store.append(data_store_per_batch)
+            new_word, incr_counter, error_count, gen_counter = recompute(curr_pos,
+                      gen_counter,
+                      model,
+                      tokenizer,
+                      start_size,
+                      recent_size,
+                      exit_layer_states,
+                      dropped_layers,
+                      prev_words,
+                      error_count,
+                      error_threshold,
+                      check_period,
+                      incr_counter,
+                      data_store_per_batch,
+                      debug)
+           
+        if debug:            
+            data_store.append(data_store_per_batch)
         shift_logits = batch_logits[:, :-1, :].contiguous()
         shift_labels = inputs[:, 1:]
         # Compute loss
@@ -276,8 +331,6 @@ def copy_kv_cache(from_layer, to_layer, bsz):
     to_layer.attention.cache_k= torch.cat((to_layer.attention.cache_k[:bsz, :-1], torch.clone(from_layer.attention.cache_k[:bsz, -1:])), dim=1)
     to_layer.attention.cache_v= torch.cat((to_layer.attention.cache_v[:bsz, :-1], torch.clone(from_layer.attention.cache_v[:bsz, -1:])), dim=1)
     torch.cuda.empty_cache()
-    
-
 
 def eval_ppl(model, tokenizer, model_args):
     # Set dataset
