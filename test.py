@@ -2,6 +2,10 @@ import os
 import fire
 from llama.generation import Llama
 from llama.model import ModelArgs
+from skip.streaming_llm import *
+from skip.utils import *
+from skip.recompute import *
+
 from typing import List
 import torch.nn as nn
 import tqdm as tqdm
@@ -85,91 +89,6 @@ def get_loaders(name, nsamples=128, seed=0, seqlen=2048, tokenizer=None):
 python -m torch.distributed.launch --nproc_per_node=1 --master_port=25691 perplexity_eval.py 
 """
 
-def get_attention_size(model):
-    cur_window_size = model.layers[0].attention.cache_k.size()[1]
-    assert(cur_window_size == model.layers[0].attention.cache_v.size()[1])
-    return cur_window_size
-
-def kv_cache_resize(model, start_size, recent_size):
-    if get_attention_size(model) >= start_size + recent_size:
-        model.kv_cache_resize(start_size, recent_size)
-
-def get_skip_param(gen_counter,
-                    step_size,
-                    min_skip_layer,
-                    max_skip_layer,
-                    incr_counter,
-                    no_skip):
-    start_skip = (max_skip_layer + 1) - incr_counter
-    end_skip = max_skip_layer
-    if incr_counter < 0:
-        raise ValueError("incr_counter can not be < 0")
-
-    if no_skip is True:
-        start_skip, end_skip = (-1, -1)
-        return -1, -1, incr_counter
-
-    if gen_counter % step_size == 0:
-        incr_counter += 1
-    if start_skip <= min_skip_layer:
-        start_skip = min_skip_layer
-    return start_skip, end_skip, incr_counter
-
-def skipped(start_skip, end_skip):
-    if start_skip <= -1 and end_skip <= -1:
-        return False
-    if start_skip > end_skip:
-        return False
-    return True
-
-def recompute(curr_pos,
-              gen_counter,
-              model,
-              tokenizer,
-              look_back,
-              start_size,
-              recent_size,
-              exit_layer_states,
-              dropped_layers,
-              prev_words,
-              error_count,
-              error_threshold,
-              check_period,
-              incr_counter,
-              data_store_per_batch,
-              debug
-              ):
-    print(len(exit_layer_states))
-    sample_pos = curr_pos - start_size - look_back
-    if sample_pos < 0:
-        sample_pos = 0
-    prev_state = exit_layer_states[sample_pos]
-    prev_start_layer, prev_end_layer = dropped_layers[sample_pos]
-    prev_word = prev_words[sample_pos]
-    new_word = prev_word
-    if not skipped(prev_start_layer, prev_end_layer):
-        return new_word, incr_counter, error_count, gen_counter
-
-    if curr_pos % check_period == 0:
-        new_out = model.recompute(prev_state,
-                                curr_pos - look_back,
-                                look_back,
-                                prev_start_layer,
-                                data_store_per_batch,
-                                debug)
-        new_token = torch.argmax(new_out[:, -1], dim=-1)
-        new_token = new_token.reshape(-1)
-        new_word = tokenizer.decode(new_token.tolist())
-        if new_word != prev_word:
-            error_count += 1
-            # TODO change check period?
-        if error_count >= error_threshold:
-            error_count = 0
-            incr_counter = 0
-            gen_counter = 0
-    
-    return new_word, incr_counter, error_count, gen_counter
-
 def evaluate_perplexity(model, tokenizer, model_args):
     dataset = "wikitext2"
     bs = 1
@@ -203,7 +122,7 @@ def evaluate_perplexity(model, tokenizer, model_args):
     # start.record()
     # Loop through each batch
     for i in range(0, nsamples, bs):
-         # parameters need for each batch
+        # parameters need for each batch
         dropped_layers = [] # record which layers (start, end_layer) are dropped for each token
         exit_layer_states = []  # for recomputation, keep the layer states of the before start_layer
         prev_words = [] # record words/tokens generated with layer skipping
@@ -236,7 +155,7 @@ def evaluate_perplexity(model, tokenizer, model_args):
 
             gen_counter += 1 
             # 1. resize the kv cache to keep a fixed size
-            kv_cache_resize(model, recent_size, prompt_size)
+            kv_cache_resize(model, prompt_size, recent_size)
 
             # 2. calculate which layers should be skipped
             start_skip, end_skip, incr_counter = get_skip_param(gen_counter,
@@ -251,7 +170,7 @@ def evaluate_perplexity(model, tokenizer, model_args):
                                                                    curr_pos,
                                                                    (start_skip, end_skip),
                                                                     data_store_per_batch,
-                                                                    True)
+                                                                    debug)
             
             # 4. keep track of skipped layers and intermediate states for recomputation
             dropped_layers.append((start_skip, end_skip))
