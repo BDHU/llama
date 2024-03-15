@@ -12,8 +12,6 @@ from skip.utils import *
 from skip.recompute import *
 
 def generate(model, tokenizer, model_args, params, prompt):
-    print("EOS")
-    print(tokenizer.eos_id)
     enc = tokenizer.encode(prompt, True, False)
     enc = torch.Tensor(enc).unsqueeze(0).type(torch.int).cuda()
     seqlen = model_args.max_seq_len
@@ -38,17 +36,23 @@ def generate(model, tokenizer, model_args, params, prompt):
     next_token = torch.argmax(logits[:, -1], dim=-1)
     next_token = next_token.reshape(-1)
     word = tokenizer.decode(next_token.tolist())
-    print(prompt)
-    print(word, end = ' ')
+
+    output_tokens = []
+    total_num_skipped = 0
+    total_layers = 0
 
     for curr_pos in range(prompt_size, model_args.max_seq_len):
         if curr_pos < params.start_size:
             next_token = next_token.reshape(1, 1)
             logits = model.forward(next_token, curr_pos)
-            next_token = torch.argmax(logits[:, -1], dim=-1)
+            if params.temperature > 0:
+                probs = torch.softmax(logits[:, -1] / params.temperature, dim=-1)
+                next_token = sample_top_p(probs, params.top_p)
+            else:
+                next_token = torch.argmax(logits[:, -1], dim=-1)
             next_token = next_token.reshape(-1)
+            output_tokens.append(next_token.item())
             word = tokenizer.decode(next_token.tolist())
-            print(word, end = ' ')
             continue
 
         gen_counter += 1
@@ -66,43 +70,51 @@ def generate(model, tokenizer, model_args, params, prompt):
         
         # 3. perform layer skipping
         next_token = next_token.reshape(1, 1)
-        logits, exit_layer_state = model.forward_with_skipping(next_token,
+        logits, exit_layer_state, num_skipped = model.forward_with_skipping(next_token,
                                                                curr_pos,
                                                                (start_skip, end_skip),
                                                                data_store_per_batch,
                                                                params.debug)
+        total_num_skipped += num_skipped
+        total_layers += params.num_decoder
+        if params.temperature > 0:
+            probs = torch.softmax(logits[:, -1] / params.temperature, dim=-1)
+            next_token = sample_top_p(probs, params.top_p)
+        else:
+            next_token = torch.argmax(logits[:, -1], dim=-1)
 
         # 4. keep track of skipped layers and intermediate states for recomputation
         dropped_layers.append((start_skip, end_skip))
         exit_layer_states.append(exit_layer_state)
+        
         next_token = torch.argmax(logits[:, -1], dim=-1)
         next_token = next_token.reshape(-1)
+        output_tokens.append(next_token.item())
+
         word = tokenizer.decode(next_token.tolist())
-        print(word, end = ' ')
         prev_words.append(word)
 
          # 5. perform recomputation
-        new_word, incr_counter, error_count, gen_counter = recompute(curr_pos,
-                    gen_counter,
-                    model,
-                    tokenizer,
-                    params.look_back,
-                    params.start_size,
-                    params.recent_size,
-                    exit_layer_states,
-                    dropped_layers,
-                    prev_words,
-                    error_count,
-                    params.error_threshold,
-                    params.check_period,
-                    incr_counter,
-                    data_store_per_batch,
-                    params.debug)
+        new_word, incr_counter, error_count, gen_counter = recompute(
+            curr_pos,
+            gen_counter,
+            model,
+            tokenizer,
+            exit_layer_states,
+            dropped_layers,
+            prev_words,
+            error_count,
+            incr_counter,
+            data_store_per_batch,
+            params,
+            )
 
-        # print(next_token)
         if next_token == tokenizer.eos_id:
             break
-           
+
+    print(prompt)
+    print(tokenizer.decode(output_tokens))
+    print(total_num_skipped / total_layers)           
 
 def main(
     ckpt_dir = "./llama-2-7b-chat",
@@ -141,9 +153,9 @@ def main(
         max_batch_size=max_batch_size,
     )
 
-    print(policy)
-    print(step_size)
     params: SkipParams = SkipParams(
+        temperature = temperature,
+        top_p = top_p,
         step_size = step_size,
         start_size = start_size,
         recent_size = recent_size,
@@ -158,9 +170,8 @@ def main(
     )
 
     ppl = generate(model, tokenizer, model_args, params, prompt)
-    fopen = open("logs/llama7b_chat_11_22.txt", "a")
-    print(f"PPL on wikitext: {ppl}\n", flush=True, file=fopen)
-    # skip = True
+    # fopen = open("logs/llama7b_chat_11_22.txt", "a")
+    # print(f"PPL on wikitext: {ppl}\n", flush=True, file=fopen)
     # print(f"{model_args}\nPrompt Len = 128\nSkip = {skip}\nTotal Layer skipped : {model.skiped_layers}/{model.total_layers} = {(float(model.skiped_layers)/model.total_layers) * 100:.3f}%\nPPL on wikitext: {ppl}\n", flush=True, file=fopen)
     # fopen.close()
 

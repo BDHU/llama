@@ -647,9 +647,10 @@ class Transformer(nn.Module):
 
         
         start_skip_layer_state = None
-
+        num_skipped = 0
         for i, layer in enumerate(self.layers):
             if should_skip(skip_params, i) is True:
+                num_skipped += 1
                 # copy kv cache
                 copy_kv_cache(self.layers[i-1], layer, _bsz, start_pos, 1)
                 if debug is True:
@@ -677,7 +678,7 @@ class Transformer(nn.Module):
         h = self.norm(h)
         output = self.output(h).float()
 
-        return output, start_skip_layer_state
+        return output, start_skip_layer_state, num_skipped
     
     @torch.inference_mode()
     def recompute(self, h: torch.Tensor, start_pos: int, look_back: int, restart_layer, datastore, debug):
