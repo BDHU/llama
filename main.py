@@ -31,13 +31,19 @@ def generate(model, tokenizer, model_args, params, prompt):
     prompt_size = enc.size()[1]
     no_skip = True if params.policy == "no_skip" else False
     
+    output_tokens = []
+    
     model.clear_kv_cache()
     logits = model.forward(enc, 0)
-    next_token = torch.argmax(logits[:, -1], dim=-1)
+    if params.temperature > 0:
+        probs = torch.softmax(logits[:, -1] / params.temperature, dim=-1)
+        next_token = sample_top_p(probs, params.top_p)
+    else:
+        next_token = torch.argmax(logits[:, -1], dim=-1)
     next_token = next_token.reshape(-1)
+    output_tokens.append(next_token.item())
     word = tokenizer.decode(next_token.tolist())
 
-    output_tokens = []
     total_num_skipped = 0
     total_layers = 0
 
