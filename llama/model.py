@@ -489,6 +489,33 @@ figuration parameters.
         out = h + self.feed_forward.forward(self.ffn_norm(h))
         return out
     
+    def forward_attention_only(
+        self,
+        x: torch.Tensor,
+        start_pos: int,
+        freqs_cis: torch.Tensor,
+        mask: Optional[torch.Tensor],
+    ):
+        """
+        Perform a forward pass through the TransformerBlock.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+            start_pos (int): Starting position for attention caching.
+            freqs_cis (torch.Tensor): Precomputed cosine and sine frequencies.
+            mask (torch.Tensor, optional): Masking tensor for attention. Defaults to None.
+
+        Returns:
+            torch.Tensor: Output tensor after applying attention and feedforward layers.
+
+        """
+        h = x + self.attention.forward(
+            self.attention_norm(x), start_pos, freqs_cis, mask
+        )
+        out = h
+        # out = h + self.feed_forward.forward(self.ffn_norm(h))
+        return out
+    
     def recompute(
         self,
         x: torch.Tensor,
@@ -606,6 +633,7 @@ class Transformer(nn.Module):
                               tokens: torch.Tensor,
                               start_pos: int,
                               skip_params,
+                              policy,
                               datastore,
                               debug):
         """
@@ -652,7 +680,11 @@ class Transformer(nn.Module):
             if should_skip(skip_params, i) is True:
                 num_skipped += 1
                 # copy kv cache
-                copy_kv_cache(self.layers[i-1], layer, _bsz, start_pos, 1)
+                if policy == "copy":
+                    copy_kv_cache(self.layers[i-1], layer, _bsz, start_pos, 1)
+                else:
+                    _ = layer.forward_attention_only(h, start_pos, freqs_cis, mask)
+                    
                 if debug is True:
                     skipped_notation = 99999999
                     if start_pos not in datastore:

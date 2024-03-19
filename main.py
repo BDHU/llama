@@ -4,6 +4,7 @@ import fire
 import os
 import random
 import numpy as np
+import pickle
 
 from llama.generation import Llama
 from llama.model import ModelArgs
@@ -47,6 +48,8 @@ def generate(model, tokenizer, model_args, params, prompt):
     total_num_skipped = 0
     total_layers = 0
 
+    newline_count = 0
+
     for curr_pos in range(prompt_size, model_args.max_seq_len):
         if curr_pos < params.start_size:
             next_token = next_token.reshape(1, 1)
@@ -79,6 +82,7 @@ def generate(model, tokenizer, model_args, params, prompt):
         logits, exit_layer_state, num_skipped = model.forward_with_skipping(next_token,
                                                                curr_pos,
                                                                (start_skip, end_skip),
+                                                                params.policy,
                                                                data_store_per_batch,
                                                                params.debug)
         total_num_skipped += num_skipped
@@ -117,10 +121,17 @@ def generate(model, tokenizer, model_args, params, prompt):
 
         if next_token == tokenizer.eos_id:
             break
+        if sum(output_tokens[-3:]) == 13 * 3:
+            break
 
+    data_store = []
+    data_store.append(data_store_per_batch)
+    print(output_tokens)
     print(prompt)
     print(tokenizer.decode(output_tokens))
-    print(total_num_skipped / total_layers)           
+    print(total_num_skipped / total_layers)
+    with open('results/test.pkl', 'wb') as f:
+        pickle.dump(data_store, f)   
 
 def main(
     ckpt_dir = "./llama-2-7b-chat",
@@ -140,7 +151,7 @@ def main(
     look_back: int = 1,
     error_threshold = 6,
     check_period: int = 10,
-    policy = "copy",
+    policy = "attention",
     debug = False,
 ):
 
